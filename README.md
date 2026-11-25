@@ -133,12 +133,25 @@ Exit codes: 0 done, 1 refused or failed with nothing written, 2 unsupported plat
 ### The Transporter route: `fm1_transporter_recover.py`
 
 For a unit with no USB device at all, through the [FM-1 Transporter](TRANSPORTER-GUIDE.md).
-macOS, Linux or Windows; no compiler needed. The short version:
+macOS or Linux; no compiler needed. The Bash launcher checks prerequisites, asks before creating
+its local Python environment or downloading/installing dependencies, and opens an interactive
+menu. From the repository directory, start it with:
 
 ```sh
-python3 fm1_transporter_recover.py setup                  # JieLi loader from jl-uboot-tool, the Transporter firmware file, pyserial
-python3 fm1_transporter_recover.py wizard --v15 FM-1.fwsc  # step-by-step: flash the XIAO, wire it, dump, write V15
+./MvaveFM1Unbrick
 ```
+
+Choose **Guided Transporter recovery**. It prompts for the firmware package if it cannot find one,
+walks through connecting the XIAO and FM-1, creates a backup, previews the repair, and still
+requires typing `WRITE` before writing. No system-wide command installation is needed; run the
+script from this project directory whenever you need it.
+
+The script uses Python 3.9+ and a project-local `.venv`. It can offer to install Python using
+Homebrew (macOS), apt, dnf, or pacman if Python is missing. Dependency setup fetches the pinned
+jl-uboot-tool loader and installs the Python requirements only after you consent. The firmware
+package itself is not downloaded or redistributed; the wizard asks you to provide it.
+
+Advanced users can still run the individual `fm1_transporter_recover.py` commands directly:
 
 | Command | What it does |
 |---|---|
