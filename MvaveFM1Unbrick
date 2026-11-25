@@ -1,11 +1,30 @@
 #!/usr/bin/env bash
+
+# This launcher provides a small interactive menu for the FM-1 recovery tools.
+# It deliberately performs only a readiness check until the user explicitly
+# selects a recovery action, and it resolves its own location before building
+# paths so that the script works when launched from another directory.
+#
+# Shell settings:
+#   - u: report and fail on references to unset variables
+#   - pipefail: make a pipeline fail if any command in it fails
 set -uo pipefail
 
+# Record the path used to invoke this script.  BASH_SOURCE[0] is preferred over
+# $0 because it continues to identify this script even in some sourced or
+# symlinked execution contexts.
 SOURCE="${BASH_SOURCE[0]}"
+
+# If the launcher was invoked by name rather than by an absolute path, make
+# SOURCE absolute by prefixing the caller's current working directory.
 case "$SOURCE" in
     /*) ;;
     *) SOURCE="$PWD/$SOURCE" ;;
 esac
+
+# Resolve a chain of symbolic links.  Each pass moves one link closer to the
+# real script, and cd -P ensures that the resulting directory has no remaining
+# logical symlink components.
 while [ -L "$SOURCE" ]; do
     SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
     TARGET="$(readlink "$SOURCE")"
@@ -15,52 +34,81 @@ while [ -L "$SOURCE" ]; do
         SOURCE="$SOURCE_DIR/$TARGET"
     fi
 done
+
+# SCRIPT_DIR is the final anchor for every repository-relative path used below.
+# Absolute paths prevent setup and recovery operations from depending on the
+# caller's current working directory.
 SCRIPT_DIR="$(cd -P -- "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# These locations are shared between the dependency checker and the Python
+# recovery implementation:
+#   VENV  - isolated Python packages for this checkout
+#   JL_DIR - jl-uboot-tool source and pinned loader data
+#   UF2    - generated Transporter firmware passed to recovery
 VENV="$SCRIPT_DIR/.venv"
 JL_DIR="$SCRIPT_DIR/jl-uboot-tool"
 UF2="$SCRIPT_DIR/transporter/fm1_transporter.uf2"
 
+# The menu is not designed to accept positional options.  Reject arguments early
+# so there is no ambiguity or accidental interpretation of shell input.
 if [ "$#" -ne 0 ]; then
     printf 'MvaveFM1Unbrick takes no command-line arguments. Run it without arguments.\n' >&2
     exit 2
 fi
 
+# Ask for a simple confirmation and accept only explicit y/yes responses.
+# Returning 1 for EOF or any negative/default answer lets callers use normal
+# shell success/failure flow to cancel an operation.
 ask_yes_no() {
     local answer
     read -r -p "$1 [y/N] " answer || return 1
     [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
 }
 
+# Check whether a particular Python executable meets the minimum supported
+# version.  The small Python process is intentionally silent and communicates
+# only through its exit status.
 python_at_least_39() {
     "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
 }
 
+# Locate a suitable package-manager command and offer to install Python plus
+# the supporting packages needed to create a virtual environment.  Package
+# installation is never automatic: every distribution branch requires consent.
 install_python() {
+    # macOS: prefer Homebrew when it is available.
     if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
         if ask_yes_no "Python 3.9+ is required. Install Python with Homebrew?"; then
             brew install python
             return $?
         fi
+    # Debian/Ubuntu: apt needs both venv and pip support for the local setup.
     elif command -v apt-get >/dev/null 2>&1; then
         if ask_yes_no "Python 3, venv and pip are required. Install them with apt?"; then
             sudo -A apt-get update && sudo -A apt-get install -y python3 python3-venv python3-pip
             return $?
         fi
+    # Fedora/RHEL-family: dnf is the recognized package-manager fallback.
     elif command -v dnf >/dev/null 2>&1; then
         if ask_yes_no "Python 3 and pip are required. Install them with dnf?"; then
             sudo -A dnf install -y python3 python3-pip
             return $?
         fi
+    # Arch-family distributions: pacman supplies Python and pip.
     elif command -v pacman >/dev/null 2>&1; then
         if ask_yes_no "Python 3 and pip are required. Install them with pacman?"; then
             sudo -A pacman -Sy --needed python python-pip
             return $?
         fi
     fi
+    # No supported installer was found, or the user declined installation.
+    # Leave the system untouched and explain the manual requirement.
     printf 'Install Python 3.9 or newer (including venv and pip), then run this command again.\n' >&2
     return 1
 }
 
+# Find Python 3.9+ without changing the user's system.
+# Prefer python3, then try python, and only after that offer package installation.
 find_python() {
     if command -v python3 >/dev/null 2>&1 && python_at_least_39 python3; then
         PYTHON=python3
@@ -70,9 +118,12 @@ find_python() {
         PYTHON=python
         return 0
     fi
+    # Both names were unsuitable or absent, so prompt for an optional install.
     if ! install_python; then
         return 1
     fi
+    # Recheck only python3 after installation; successful setup should make it
+    # available, and an unsupported/absent result is reported explicitly.
     if command -v python3 >/dev/null 2>&1 && python_at_least_39 python3; then
         PYTHON=python3
         return 0
@@ -81,6 +132,8 @@ find_python() {
     return 1
 }
 
+# Create the repository-local virtual environment used for all recovery scripts.
+# On Debian-style systems, retry after an optional install of python3-venv.
 create_venv() {
     if "$PYTHON" -m venv "$VENV"; then
         return 0
@@ -95,6 +148,9 @@ create_venv() {
     return 1
 }
 
+# Perform a complete readiness check before permitting the recovery wizard.
+# This command covers the executable environment, Python serial support, pinned
+# loader file, firmware file, and the setup state known to the helper script.
 dependencies_ready() {
     [ -x "$VENV/bin/python" ] || return 1
     "$VENV/bin/python" -c 'import serial, serial.tools.list_ports' >/dev/null 2>&1 || return 1
@@ -104,11 +160,16 @@ dependencies_ready() {
         >/dev/null 2>&1
 }
 
+# Prepare everything needed for recovery, but only after explaining and
+# requesting consent for downloads and package installation.
 prepare_dependencies() {
+    # Fast path: all checks pass, so report readiness and avoid network activity.
     if dependencies_ready; then
         printf 'Python environment, pyserial, JieLi loader and Transporter firmware are ready.\n'
         return 0
     fi
+
+    # Explain exactly which dependency categories may be created or downloaded.
     printf 'Dependencies needed: a local Python environment, pyserial, jl-uboot-tool and its\n'
     printf 'pinned loader, plus the generated Transporter firmware. Setup may download files\n'
     printf 'and install Python packages from the internet.\n'
@@ -116,13 +177,21 @@ prepare_dependencies() {
         printf 'Setup cancelled; no dependency download or installation was started.\n'
         return 1
     fi
+
+    # The virtual environment itself may need to be created before setup runs.
     if [ ! -x "$VENV/bin/python" ] && ! create_venv; then
         return 1
     fi
+
+    # Delegate package cloning/installation and firmware generation to the
+    # repository's Python setup implementation.
     if ! "$VENV/bin/python" "$SCRIPT_DIR/fm1_transporter_recover.py" setup --yes; then
         printf 'Dependency setup failed. Review the error above and try again when ready.\n' >&2
         return 1
     fi
+
+    # Setup can exit successfully yet still be incomplete, so verify every
+    # required artifact once more before allowing recovery to begin.
     if ! dependencies_ready; then
         printf 'Setup finished, but one or more required files/packages are still missing.\n' >&2
         return 1
@@ -130,22 +199,33 @@ prepare_dependencies() {
     return 0
 }
 
+# Initial application boot: find an acceptable Python interpreter before
+# displaying the menu.  A failure here exits immediately instead of presenting
+# options that cannot be used.
 if ! find_python; then
     exit 1
 fi
 
+# Main menu loop.  It remains active until the user chooses Exit, presses EOF,
+# or cancels keyboard input in another way.
 while true; do
     printf '\nMvave FM-1 Unbrick\n'
     printf '  1. Guided Transporter recovery\n'
     printf '  2. Check/setup dependencies only\n'
     printf '  3. Exit\n'
+
+    # read -r preserves backslashes while -p displays an interactive prompt.
+    # An EOF or read error is treated as "No keyboard input" and exits safely.
     read -r -p 'Choose [1-3]: ' choice || {
         printf '\nNo keyboard input; exiting without accessing the FM-1.\n'
         exit 1
     }
 
+    # Dispatch exactly one menu action for each valid numeric selection.
     case "$choice" in
         1)
+            # Only enter the guided wizard after prepare_dependencies succeeds;
+            # this keeps missing tools and firmware from reaching recovery code.
             if prepare_dependencies; then
                 "$VENV/bin/python" "$SCRIPT_DIR/fm1_transporter_recover.py" wizard
                 result=$?
@@ -155,12 +235,17 @@ while true; do
             fi
             ;;
         2)
+            # Dependency/setup mode can finish successfully or fail; true prevents
+            # that status from terminating the menu loop.
             prepare_dependencies || true
             ;;
         3)
+            # Explicitly return success because the user chose to end the launcher.
             exit 0
             ;;
         *)
+            # Invalid input is reported but is not fatal, allowing the menu to
+            # redraw and accept another choice.
             printf 'Choose 1, 2 or 3.\n'
             ;;
     esac
